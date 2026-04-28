@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod chat_sessions;
 pub mod compress;
 pub mod crypto;
 pub mod db_state;
@@ -40,6 +41,7 @@ pub mod watch;
 pub mod window;
 
 pub use compress::*;
+pub use chat_sessions::*;
 pub use crypto::*;
 pub use db_state::*;
 pub use debug::*;

@@ -7,29 +7,65 @@ import { renderMarkdown } from '../markdownRenderer.js';
 import { Collapsible } from '../collapsible/collapsible.js';
 import { FilesExplored } from '../tools/filesExplored.js';
 import { StepsPlanned } from '../tools/stepsPlanned.js';
-import { ToolCallItem } from '../tools/toolCallItem.js';
+import { ToolCallItem, FileEditInfo } from '../tools/toolCallItem.js';
+import { ThinkingBlock } from './thinkingBlock.js';
+
+const EDIT_TOOL_NAMES = new Set([
+	'edit_file', 'write_file', 'multi_edit', 'create_file',
+	'str_replace_editor', 'insert_text', 'replace_in_file',
+]);
 
 export class AssistantMessage extends Component {
 	private readonly _onCopy = this._register(new Emitter<string>());
 	readonly onCopy: Event<string> = this._onCopy.event;
+	private _thinkingBlock: ThinkingBlock | null = null;
 
-	constructor(msg: IChatMessage, turnDurationMs?: number, onFileClick?: (path: string) => void) {
+	get thinkingBlock(): ThinkingBlock | null { return this._thinkingBlock; }
+
+	constructor(msg: IChatMessage, turnDurationMs?: number, onFileClick?: (path: string) => void, isThinking?: boolean) {
 		super('div', 'sc-assistant-msg');
 
+		// Thinking block — rendered above everything else
+		if (msg.thinkingContent || isThinking) {
+			this._thinkingBlock = new ThinkingBlock();
+			this._thinkingBlock.appendTo(this.element);
+			this._register(this._thinkingBlock);
+			if (msg.thinkingContent) {
+				this._thinkingBlock.setFullContent(msg.thinkingContent);
+			}
+			if (isThinking) {
+				this._thinkingBlock.startStreaming();
+			}
+		}
+
 		const hasTools = msg.toolCalls && msg.toolCalls.length > 0;
+		const editInfoMap = hasTools ? buildEditInfoMap(msg.toolCalls!) : new Map<string, FileEditInfo>();
 
 		// Only show "Worked for Xs" collapsible when there are actual tool calls
 		if (hasTools && turnDurationMs && turnDurationMs > 500) {
-			const activitySection = new Collapsible(
-				`Worked for ${formatDuration(turnDurationMs)}`,
-				undefined
-			);
-			activitySection.appendTo(this.element);
-			this._register(activitySection);
+			// Partition tool calls: edits shown outside the collapsible, rest inside
+			const nonEditCalls = msg.toolCalls!.filter(tc => !EDIT_TOOL_NAMES.has(tc.name));
+			const editCalls = msg.toolCalls!.filter(tc => EDIT_TOOL_NAMES.has(tc.name));
 
-			for (const tc of msg.toolCalls!) {
-				const item = new ToolCallItem(tc);
-				item.appendTo(activitySection.body);
+			if (nonEditCalls.length > 0) {
+				const activitySection = new Collapsible(
+					`Worked for ${formatDuration(turnDurationMs)}`,
+				);
+				activitySection.appendTo(this.element);
+				this._register(activitySection);
+
+				for (const tc of nonEditCalls) {
+					const item = new ToolCallItem(tc);
+					item.appendTo(activitySection.body);
+					this._register(item);
+				}
+			}
+
+			// Render edit tool calls with inline diffs directly in the message
+			for (const tc of editCalls) {
+				const editInfo = editInfoMap.get(tc.id);
+				const item = new ToolCallItem(tc, editInfo);
+				item.appendTo(this.element);
 				this._register(item);
 			}
 		}
@@ -104,4 +140,77 @@ function extractSteps(toolCalls: IToolCallInfo[]): string[] {
 		}
 	}
 	return steps;
+}
+
+/**
+ * Build a map of tool_call_id -> FileEditInfo by pairing read_file results
+ * (old content) with subsequent edit tool calls (new content from output).
+ *
+ * Strategy:
+ * 1. Track the last-read content per file path from read_file calls.
+ * 2. For edit tools, parse the file path from the input args.
+ * 3. The old content comes from a prior read_file, or defaults to empty.
+ * 4. The new content comes from the tool output (the server often echoes the result),
+ *    or can be reconstructed from input args for write_file/create_file.
+ */
+function buildEditInfoMap(toolCalls: IToolCallInfo[]): Map<string, FileEditInfo> {
+	const result = new Map<string, FileEditInfo>();
+	const fileContents = new Map<string, string>();
+
+	for (const tc of toolCalls) {
+		// Track file reads to capture "before" content
+		if (READ_TOOLS.has(tc.name) && tc.input && tc.output) {
+			try {
+				const args = JSON.parse(tc.input);
+				if (args.path && typeof tc.output === 'string') {
+					fileContents.set(args.path, tc.output);
+				}
+			} catch { /* ignore */ }
+		}
+
+		// Process edit tools
+		if (EDIT_TOOL_NAMES.has(tc.name) && tc.input && tc.status === 'done') {
+			try {
+				const args = JSON.parse(tc.input);
+				const filePath = args.path || args.file_path || args.file || '';
+				if (!filePath) { continue; }
+
+				const oldContent = fileContents.get(filePath) || '';
+				let newContent = '';
+
+				if (tc.name === 'write_file' || tc.name === 'create_file') {
+					newContent = args.content || args.text || '';
+				} else if (tc.name === 'str_replace_editor' || tc.name === 'edit_file') {
+					// For str_replace style edits, apply the replacement to old content
+					if (args.old_str != null && args.new_str != null && oldContent) {
+						newContent = oldContent.replace(args.old_str, args.new_str);
+					} else if (args.content) {
+						newContent = args.content;
+					} else if (tc.output) {
+						newContent = tc.output;
+					}
+				} else if (tc.name === 'multi_edit') {
+					// Multi-edit: apply sequence of replacements
+					let content = oldContent;
+					const edits = args.edits || [];
+					for (const edit of edits) {
+						if (edit.old_text != null && edit.new_text != null) {
+							content = content.replace(edit.old_text, edit.new_text);
+						}
+					}
+					newContent = content;
+				} else {
+					newContent = tc.output || '';
+				}
+
+				if (newContent && newContent !== oldContent) {
+					result.set(tc.id, { filePath, oldContent, newContent });
+					// Update tracked content so subsequent edits to the same file see the latest
+					fileContents.set(filePath, newContent);
+				}
+			} catch { /* ignore parse errors */ }
+		}
+	}
+
+	return result;
 }

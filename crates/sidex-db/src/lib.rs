@@ -20,6 +20,7 @@
 //!   NUL byte detection).
 
 pub mod db;
+pub mod chat_sessions;
 pub mod history;
 pub mod recent;
 pub mod state;
@@ -28,6 +29,10 @@ pub mod validation;
 pub mod window_state;
 
 pub use db::{Database, CURRENT_SCHEMA_VERSION};
+pub use chat_sessions::{
+    create_session, save_session, save_message, list_sessions, load_messages, delete_session,
+    search_sessions, update_session_title, ChatMessage, ChatSession,
+};
 pub use history::{
     add_clipboard_entry, add_search_history, add_terminal_session, all_breakpoints,
     bookmarks_for_file, breakpoints_for_file, clear_breakpoints, clear_clipboard_history,

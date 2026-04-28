@@ -95,6 +95,13 @@ registerAction2(class extends Action2 {
 // Register the status bar entries on startup
 import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import { IDisposable } from '../../../../base/common/lifecycle.js';
+import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
+import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+import { SidexCompletionProvider } from './autocomplete/sidexCompletionProvider.js';
+import { ICodeEditorService } from '../../../../editor/browser/services/codeEditorService.js';
+import { InlineEditController } from './inline/inlineEditController.js';
+import { isCodeEditor } from '../../../../editor/browser/editorBrowser.js';
+import { EditorContextKeys } from '../../../../editor/common/editorContextKeys.js';
 
 class SidexStatusBarContribution implements IWorkbenchContribution {
 	static readonly ID = 'sidex.statusbar';
@@ -178,3 +185,58 @@ class SidexStatusBarContribution implements IWorkbenchContribution {
 }
 
 registerWorkbenchContribution2(SidexStatusBarContribution.ID, SidexStatusBarContribution, WorkbenchPhase.AfterRestored);
+
+class SidexInlineCompletionContribution implements IWorkbenchContribution {
+	static readonly ID = 'sidex.inlineCompletion';
+
+	constructor(
+		@ILanguageFeaturesService languageFeaturesService: ILanguageFeaturesService,
+		@IConfigurationService configurationService: IConfigurationService,
+	) {
+		const provider = new SidexCompletionProvider(configurationService);
+		languageFeaturesService.inlineCompletionsProvider.register('*', provider);
+	}
+}
+
+registerWorkbenchContribution2(SidexInlineCompletionContribution.ID, SidexInlineCompletionContribution, WorkbenchPhase.AfterRestored);
+
+// --- CMD+K Inline Edit ---
+
+// One InlineEditController per editor, lazily created
+const controllerMap = new WeakMap<object, InlineEditController>();
+
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: 'sidex.inlineEdit.activate',
+			title: nls.localize2('sidexInlineEdit', 'Sidex: Inline Edit'),
+			keybinding: {
+				primary: KeyMod.CtrlCmd | KeyCode.KeyK,
+				weight: KeybindingWeight.EditorContrib + 100,
+				when: EditorContextKeys.editorTextFocus,
+			},
+			f1: true,
+		});
+	}
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const codeEditorService = accessor.get(ICodeEditorService);
+		const configService = accessor.get(IConfigurationService);
+		const editor = codeEditorService.getFocusedCodeEditor();
+		if (!editor || !isCodeEditor(editor)) {
+			return;
+		}
+
+		let controller = controllerMap.get(editor);
+		if (!controller) {
+			controller = new InlineEditController(editor, configService);
+			controllerMap.set(editor, controller);
+			// Clean up when editor is disposed
+			editor.onDidDispose(() => {
+				controller?.dispose();
+				controllerMap.delete(editor);
+			});
+		}
+
+		controller.activate();
+	}
+});

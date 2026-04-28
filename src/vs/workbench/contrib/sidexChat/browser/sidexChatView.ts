@@ -22,6 +22,7 @@ import { ChatHeader } from './components/toolbar/chatHeader.js';
 import { ChatInput } from './components/input/chatInput.js';
 import { UserMessage } from './components/messages/userMessage.js';
 import { AssistantMessage } from './components/messages/assistantMessage.js';
+import { PermissionRequestDialog, PermissionRequestData } from './components/messages/permissionRequest.js';
 
 const $ = DOM.$;
 
@@ -133,11 +134,32 @@ export class SidexChatViewPane extends ViewPane {
 			if (chunk.type === 'mode_change' && chunk.mode) {
 				this._input.setMode(chunk.mode as 'agent' | 'plan' | 'ask');
 			}
+			if (chunk.type === 'thinking' && chunk.content) {
+				const comp = this._currentAssistantComp;
+				if (comp?.thinkingBlock) {
+					comp.thinkingBlock.appendContent(chunk.content);
+				}
+			}
+			if (chunk.type === 'thinking_done') {
+				const comp = this._currentAssistantComp;
+				if (comp?.thinkingBlock) {
+					comp.thinkingBlock.stopStreaming();
+				}
+			}
+			if (chunk.type === 'permission_request' && chunk.tool_call_id && chunk.tool_name) {
+				this._showPermissionDialog({
+					toolCallId: chunk.tool_call_id,
+					toolName: chunk.tool_name,
+					args: chunk.args,
+				});
+			}
 			if (chunk.type === 'text') {
 				this._scrollToBottom();
 			}
 		}));
 	}
+
+	private _currentAssistantComp: AssistantMessage | null = null;
 
 	private _renderMessages(messages: readonly IChatMessage[]): void {
 		if (!this._messagesEl) { return; }
@@ -146,6 +168,7 @@ export class SidexChatViewPane extends ViewPane {
 		this._welcomeEl.style.display = hasMessages ? 'none' : 'flex';
 
 		DOM.clearNode(this._messagesEl);
+		this._currentAssistantComp = null;
 		if (!hasMessages) {
 			this._messagesEl.appendChild(this._welcomeEl);
 			return;
@@ -159,14 +182,19 @@ export class SidexChatViewPane extends ViewPane {
 				this._viewDisposables.add(comp);
 			} else if (msg.role === 'assistant') {
 				const duration = this._turnStartTime > 0 ? Date.now() - this._turnStartTime : 0;
+				const isThinking = this.chatService.isThinking &&
+					msg === messages[messages.length - 1];
 				const comp = new AssistantMessage(msg, duration, (filePath) => {
 					this._openFile(filePath);
-				});
+				}, isThinking);
 				comp.appendTo(this._messagesEl);
 				this._viewDisposables.add(comp);
 				this._viewDisposables.add(comp.onCopy(text => {
 					navigator.clipboard.writeText(text).catch(() => { /* ignore */ });
 				}));
+				if (msg === messages[messages.length - 1]) {
+					this._currentAssistantComp = comp;
+				}
 			}
 		}
 
@@ -212,5 +240,16 @@ export class SidexChatViewPane extends ViewPane {
 	private _openFile(filePath: string): void {
 		const uri = URI.file(filePath);
 		this.editorService.openEditor({ resource: uri }).then(undefined, () => { /* ignore */ });
+	}
+
+	private _showPermissionDialog(data: PermissionRequestData): void {
+		if (!this._messagesEl) { return; }
+		const dialog = new PermissionRequestDialog(data);
+		dialog.appendTo(this._messagesEl);
+		this._viewDisposables.add(dialog);
+		this._viewDisposables.add(dialog.onRespond(result => {
+			this.chatService.respondToPermission(result.toolCallId, result.approved);
+		}));
+		this._scrollToBottom();
 	}
 }

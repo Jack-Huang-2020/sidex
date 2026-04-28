@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump when adding migrations.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Wraps a `SQLite` connection and ensures schema migrations run on open.
 pub struct Database {
@@ -99,6 +99,9 @@ impl Database {
         }
         if current < 3 {
             self.migration_v3()?;
+        }
+        if current < 4 {
+            self.migration_v4()?;
         }
 
         self.conn
@@ -290,6 +293,44 @@ impl Database {
                 ",
             )
             .context("migration v3")?;
+        Ok(())
+    }
+
+    /// V4: chat session persistence.
+    fn migration_v4(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id              TEXT PRIMARY KEY,
+                    title           TEXT NOT NULL DEFAULT 'Untitled',
+                    created_at      INTEGER NOT NULL,
+                    updated_at      INTEGER NOT NULL,
+                    model           TEXT NOT NULL DEFAULT '',
+                    mode            TEXT NOT NULL DEFAULT 'agent',
+                    workspace       TEXT NOT NULL DEFAULT '',
+                    message_count   INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id              TEXT PRIMARY KEY,
+                    session_id      TEXT NOT NULL,
+                    role            TEXT NOT NULL,
+                    content         TEXT NOT NULL DEFAULT '',
+                    tool_calls      TEXT,
+                    tool_call_id    TEXT,
+                    created_at      INTEGER NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES chat_sessions(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_chat_sessions_workspace
+                    ON chat_sessions(workspace, updated_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_session
+                    ON chat_messages(session_id, created_at ASC);
+                ",
+            )
+            .context("migration v4")?;
         Ok(())
     }
 }

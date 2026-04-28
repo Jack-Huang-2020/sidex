@@ -641,6 +641,14 @@ pub fn run() {
             commands::db_get_recent_workspaces,
             commands::db_save_workspace_state,
             commands::db_get_workspace_state,
+            // Chat session persistence
+            commands::session_create,
+            commands::session_list,
+            commands::session_load,
+            commands::session_save_message,
+            commands::session_delete,
+            commands::session_search,
+            commands::session_update_title,
             // Layered settings
             commands::settings_get,
             commands::settings_update,

@@ -12,6 +12,10 @@ impl SidexDbState {
     pub fn new(db: Database) -> Self {
         Self { db: Mutex::new(db) }
     }
+
+    pub fn lock_db(&self) -> Result<std::sync::MutexGuard<'_, Database>, std::sync::PoisonError<std::sync::MutexGuard<'_, Database>>> {
+        self.db.lock()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -2,8 +2,16 @@ import { Component, DOM, $ } from '../base.js';
 import { Emitter, Event } from '../../../../../../base/common/event.js';
 import { Codicon } from '../../../../../../base/common/codicons.js';
 import { ThemeIcon } from '../../../../../../base/common/themables.js';
+import { MentionPopup } from './mentionPopup.js';
+import { MentionResolver, MentionItem } from '../../context/mentionResolver.js';
+import { URI } from '../../../../../../base/common/uri.js';
 
 export type AgentMode = 'agent' | 'plan' | 'ask';
+
+export interface ResolvedMention {
+	item: MentionItem;
+	resolvedContent: string;
+}
 
 function codicon(c: ThemeIcon): HTMLSpanElement {
 	const el = document.createElement('span');
@@ -21,8 +29,19 @@ export class ChatInput extends Component {
 	private _currentMode: AgentMode = 'agent';
 	private _currentModel = '';
 
+	// Mention system
+	private _mentionPopup: MentionPopup;
+	private _mentionResolver: MentionResolver;
+	private _mentionPillsContainer: HTMLElement;
+	private _resolvedMentions: ResolvedMention[] = [];
+	private _mentionTracking: { active: boolean; startPos: number } = { active: false, startPos: -1 };
+	private _debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
 	private readonly _onSend = this._register(new Emitter<string>());
 	readonly onSend: Event<string> = this._onSend.event;
+
+	private readonly _onSendWithMentions = this._register(new Emitter<{ text: string; mentions: ResolvedMention[] }>());
+	readonly onSendWithMentions: Event<{ text: string; mentions: ResolvedMention[] }> = this._onSendWithMentions.event;
 
 	private readonly _onStop = this._register(new Emitter<void>());
 	readonly onStop: Event<void> = this._onStop.event;
@@ -34,11 +53,15 @@ export class ChatInput extends Component {
 	readonly onModelChange: Event<string> = this._onModelChange.event;
 
 	get mode(): AgentMode { return this._currentMode; }
+	get resolvedMentions(): readonly ResolvedMention[] { return this._resolvedMentions; }
 
 	constructor() {
 		super('div', 'sc-input-area');
 
 		const container = this.append('div', 'sc-input-container');
+
+		// Mention pills container — sits above the textarea
+		this._mentionPillsContainer = DOM.append(container, $('div.sc-mention-pills'));
 
 		this._textareaEl = DOM.append(container, $('textarea.sc-textarea')) as HTMLTextAreaElement;
 		this._textareaEl.placeholder = 'Plan, Build, / for commands, @ for context';
@@ -117,21 +140,93 @@ export class ChatInput extends Component {
 		this._stopBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M5 4C4.44772 4 4 4.44772 4 5V9C4 9.5523 4.44772 10 5 10H9C9.5523 10 10 9.5523 10 9V5C10 4.44772 9.5523 4 9 4H5ZM0 7C0 3.13401 3.13401 0 7 0C10.866 0 14 3.13401 14 7C14 10.866 10.866 14 7 14C3.13401 14 0 10.866 0 7Z"/></svg>';
 		this._stopBtn.style.display = 'none';
 
+		// Initialize mention system
+		this._mentionResolver = new MentionResolver({
+			findFiles: async (pattern: string, maxResults: number): Promise<URI[]> => {
+				try {
+					const vscode = (globalThis as any).vscode;
+					if (vscode?.workspace?.findFiles) {
+						return await vscode.workspace.findFiles(pattern, '**/node_modules/**', maxResults);
+					}
+				} catch { /* fallback */ }
+				return [];
+			},
+			readFile: async (uri: URI): Promise<string> => {
+				try {
+					const vscode = (globalThis as any).vscode;
+					if (vscode?.workspace?.fs?.readFile) {
+						const bytes = await vscode.workspace.fs.readFile(uri);
+						return new TextDecoder().decode(bytes);
+					}
+				} catch { /* fallback */ }
+				return '';
+			},
+			readDirectory: async (uri: URI): Promise<Array<[string, 'file' | 'directory']>> => {
+				try {
+					const vscode = (globalThis as any).vscode;
+					if (vscode?.workspace?.fs?.readDirectory) {
+						const entries = await vscode.workspace.fs.readDirectory(uri);
+						return entries.map((e: [string, number]) => [e[0], e[1] === 2 ? 'directory' : 'file'] as [string, 'file' | 'directory']);
+					}
+				} catch { /* fallback */ }
+				return [];
+			},
+			getWorkspaceFolderPath: (): string | undefined => {
+				try {
+					const vscode = (globalThis as any).vscode;
+					if (vscode?.workspace?.workspaceFolders?.[0]) {
+						return vscode.workspace.workspaceFolders[0].uri.fsPath;
+					}
+				} catch { /* fallback */ }
+				return undefined;
+			},
+		});
+
+		this._mentionPopup = new MentionPopup(this.element, (item) => this._onMentionSelected(item));
+		this._disposables.add(this._mentionPopup);
+
+		// Keyboard events — handle mention popup navigation before normal input handling
 		this.on(this._textareaEl, 'keydown', (e) => {
 			const ke = e as KeyboardEvent;
+
+			if (this._mentionPopup.isVisible) {
+				if (ke.key === 'ArrowDown') {
+					ke.preventDefault();
+					this._mentionPopup.selectNext();
+					return;
+				}
+				if (ke.key === 'ArrowUp') {
+					ke.preventDefault();
+					this._mentionPopup.selectPrevious();
+					return;
+				}
+				if (ke.key === 'Enter' || ke.key === 'Tab') {
+					ke.preventDefault();
+					this._mentionPopup.confirmSelection();
+					return;
+				}
+				if (ke.key === 'Escape') {
+					ke.preventDefault();
+					this._mentionPopup.hide();
+					this._mentionTracking.active = false;
+					return;
+				}
+			}
+
 			if (ke.key === 'Enter' && !ke.shiftKey) {
 				ke.preventDefault();
 				this._doSend();
 			}
 		});
+
 		this.on(this._textareaEl, 'input', () => {
 			this._autoResize();
-			const hasText = this._textareaEl.value.trim().length > 0;
+			const hasText = this._textareaEl.value.trim().length > 0 || this._resolvedMentions.length > 0;
 			this._sendBtn.classList.toggle('disabled', !hasText);
+			this._handleMentionInput();
 		});
 		this.on(this._sendBtn, 'click', () => this._doSend());
 
-		// Start disabled
 		this._sendBtn.classList.add('disabled');
 		this.on(this._stopBtn, 'click', () => this._onStop.fire());
 	}
@@ -154,7 +249,6 @@ export class ChatInput extends Component {
 	/** Set the model name shown in the footer. Called by the view when server info arrives. */
 	setModel(model: string): void {
 		this._currentModel = model;
-		// Show a clean short name: "claude-sonnet-4-6" instead of "us.anthropic.claude-sonnet-4-20250514-v1:0"
 		const short = model
 			.replace(/^us\.anthropic\./, '')
 			.replace(/-\d{8}-v\d+:\d+$/, '')
@@ -192,13 +286,166 @@ export class ChatInput extends Component {
 		this._onModeChange.fire(mode);
 	}
 
+	// --- Mention system ---
+
+	private _handleMentionInput(): void {
+		const value = this._textareaEl.value;
+		const cursorPos = this._textareaEl.selectionStart;
+		const textBefore = value.substring(0, cursorPos);
+		const atIndex = textBefore.lastIndexOf('@');
+
+		// Must have an @, and it must be at the start or preceded by whitespace
+		if (atIndex === -1) {
+			this._mentionTracking.active = false;
+			this._mentionPopup.hide();
+			return;
+		}
+		if (atIndex > 0 && textBefore[atIndex - 1] !== ' ' && textBefore[atIndex - 1] !== '\n') {
+			this._mentionTracking.active = false;
+			this._mentionPopup.hide();
+			return;
+		}
+
+		const query = textBefore.substring(atIndex + 1);
+
+		// A space within the query terminates the mention
+		if (query.includes(' ')) {
+			this._mentionTracking.active = false;
+			this._mentionPopup.hide();
+			return;
+		}
+
+		this._mentionTracking = { active: true, startPos: atIndex };
+		this._debouncedSearch(query);
+	}
+
+	private _debouncedSearch(query: string): void {
+		if (this._debounceTimer) {
+			clearTimeout(this._debounceTimer);
+		}
+		this._debounceTimer = setTimeout(async () => {
+			try {
+				const suggestions = await this._mentionResolver.getSuggestions(query);
+				if (!this._mentionTracking.active) { return; }
+
+				const anchorRect = this._getCaretRect();
+				this._mentionPopup.show(suggestions, anchorRect);
+			} catch {
+				this._mentionPopup.hide();
+			}
+		}, 150);
+	}
+
+	private _getCaretRect(): DOMRect {
+		// Approximate caret position using a temporary span
+		const textarea = this._textareaEl;
+		const rect = textarea.getBoundingClientRect();
+
+		// Rough estimation: use textarea position as anchor
+		return new DOMRect(
+			rect.left + 12,
+			rect.top,
+			1,
+			20
+		);
+	}
+
+	private async _onMentionSelected(item: MentionItem): Promise<void> {
+		if (!this._mentionTracking.active) { return; }
+
+		const value = this._textareaEl.value;
+		const cursorPos = this._textareaEl.selectionStart;
+		const before = value.substring(0, this._mentionTracking.startPos);
+		const after = value.substring(cursorPos);
+
+		// Remove "@query" from textarea and replace with nothing (pill goes above)
+		this._textareaEl.value = before + after;
+		this._textareaEl.selectionStart = before.length;
+		this._textareaEl.selectionEnd = before.length;
+
+		this._mentionTracking.active = false;
+		this._autoResize();
+
+		// Resolve the mention content
+		let resolvedContent = '';
+		try {
+			resolvedContent = await this._mentionResolver.resolve(item);
+		} catch {
+			resolvedContent = `[Could not resolve: ${item.label}]`;
+		}
+
+		const mention: ResolvedMention = { item, resolvedContent };
+		this._resolvedMentions.push(mention);
+		this._renderMentionPill(mention);
+
+		const hasText = this._textareaEl.value.trim().length > 0 || this._resolvedMentions.length > 0;
+		this._sendBtn.classList.toggle('disabled', !hasText);
+
+		this._textareaEl.focus();
+	}
+
+	private _renderMentionPill(mention: ResolvedMention): void {
+		const pill = document.createElement('span');
+		pill.className = 'sc-mention-pill';
+
+		const iconEl = document.createElement('span');
+		iconEl.className = 'sc-mention-pill-icon';
+		if (mention.item.type === 'folder') {
+			iconEl.classList.add('codicon', 'codicon-folder');
+		} else if (mention.item.type === 'symbol') {
+			iconEl.classList.add('codicon', 'codicon-symbol-method');
+		} else {
+			iconEl.classList.add('codicon', 'codicon-file');
+		}
+		pill.appendChild(iconEl);
+
+		const labelEl = document.createElement('span');
+		labelEl.className = 'sc-mention-pill-label';
+		labelEl.textContent = mention.item.label;
+		pill.appendChild(labelEl);
+
+		const removeBtn = document.createElement('span');
+		removeBtn.className = 'sc-mention-pill-remove';
+		removeBtn.innerHTML = '&times;';
+		removeBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			const idx = this._resolvedMentions.indexOf(mention);
+			if (idx !== -1) { this._resolvedMentions.splice(idx, 1); }
+			pill.remove();
+			const hasText = this._textareaEl.value.trim().length > 0 || this._resolvedMentions.length > 0;
+			this._sendBtn.classList.toggle('disabled', !hasText);
+		});
+		pill.appendChild(removeBtn);
+
+		this._mentionPillsContainer.appendChild(pill);
+		this._mentionPillsContainer.style.display = '';
+	}
+
+	// --- Send ---
+
 	private _doSend(): void {
 		const text = this._textareaEl.value.trim();
-		if (!text) { return; }
+		if (!text && this._resolvedMentions.length === 0) { return; }
+
 		this._textareaEl.value = '';
 		this._autoResize();
 		this._sendBtn.classList.add('disabled');
-		this._onSend.fire(text);
+
+		// Build the full message with mention context prepended
+		let fullMessage = '';
+		for (const m of this._resolvedMentions) {
+			fullMessage += `<context source="@${m.item.label}">\n${m.resolvedContent}\n</context>\n\n`;
+		}
+		fullMessage += text;
+
+		// Clear mentions
+		const mentionsCopy = [...this._resolvedMentions];
+		this._resolvedMentions = [];
+		DOM.clearNode(this._mentionPillsContainer);
+		this._mentionPillsContainer.style.display = 'none';
+
+		this._onSendWithMentions.fire({ text: fullMessage, mentions: mentionsCopy });
+		this._onSend.fire(fullMessage);
 	}
 
 	private _autoResize(): void {
