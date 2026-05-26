@@ -22,8 +22,10 @@
         "decorations": false,
         "shadow": true,
         "visible": false,
-        "dragDropEnabled": false,
-        "useHttpsScheme": true
+        "dragDropEnabled": true,
+        "useHttpsScheme": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {
