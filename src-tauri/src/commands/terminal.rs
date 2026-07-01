@@ -471,7 +471,8 @@ pub fn check_shell_exists(path: String) -> bool {
 #[tauri::command]
 #[allow(clippy::too_many_lines)]
 pub fn get_available_shells() -> Vec<ShellInfo> {
-    if cfg!(target_os = "windows") {
+    #[cfg(target_os = "windows")]
+    {
         let candidates: &[(&str, &str)] = &[
             ("PowerShell", "powershell.exe"),
             ("PowerShell Core", "pwsh.exe"),
