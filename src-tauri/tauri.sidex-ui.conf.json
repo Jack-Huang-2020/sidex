@@ -60,7 +60,6 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": "Developer ID Application: kima Booker (D983H3RN86)",
       "entitlements": "entitlements.plist",
       "minimumSystemVersion": "10.15"
     },
