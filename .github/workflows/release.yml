@@ -96,12 +96,6 @@ jobs:
           NODE_OPTIONS: "--max-old-space-size=12288"
         run: npm run build
 
-      - name: Unlock keychain before signing
-        if: runner.os == 'macOS'
-        env:
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-
       - name: Build Tauri app
         timeout-minutes: 40
         env:
