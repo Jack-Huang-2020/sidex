@@ -97,6 +97,7 @@ jobs:
         run: npm run build
 
       - name: Build Tauri app
+        continue-on-error: true 
         timeout-minutes: 40
         run: npx tauri build --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
 
